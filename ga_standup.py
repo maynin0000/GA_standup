@@ -15,6 +15,11 @@ DEFAULT_STEPS = 480
 SIM_DT = 1.0 / 240.0
 JOINT_FORCE_LIMIT = 46.0
 POPULATION_SPACING = 1.4
+DEFAULT_POPULATION = 100
+DEFAULT_PARENT_POOL = 10
+START_BASE_HEIGHT = 0.11
+X_AXIS_CAPSULE_ORIENTATION = p.getQuaternionFromEuler([0, math.radians(90), 0])
+FOOT_HALF_EXTENTS = [0.055, 0.18, 0.14]
 
 SPINE = 0
 NECK = 1
@@ -28,7 +33,20 @@ LEFT_ANKLE = 8
 RIGHT_HIP = 9
 RIGHT_KNEE = 10
 RIGHT_ANKLE = 11
-CONTROL_JOINTS = 12
+LINK_COUNT = 12
+CONTROLLED_JOINTS = (
+    SPINE,
+    NECK,
+    LEFT_SHOULDER,
+    LEFT_ELBOW,
+    RIGHT_SHOULDER,
+    RIGHT_ELBOW,
+    LEFT_HIP,
+    LEFT_KNEE,
+    RIGHT_HIP,
+    RIGHT_KNEE,
+)
+CONTROL_DOF = len(CONTROLLED_JOINTS)
 
 
 @dataclass(frozen=True)
@@ -47,10 +65,8 @@ def pose(
     right_elbow: float,
     left_hip: float,
     left_knee: float,
-    left_ankle: float,
     right_hip: float,
     right_knee: float,
-    right_ankle: float,
 ) -> np.ndarray:
     return np.array(
         [
@@ -62,10 +78,8 @@ def pose(
             right_elbow,
             left_hip,
             left_knee,
-            left_ankle,
             right_hip,
             right_knee,
-            right_ankle,
         ],
         dtype=float,
     )
@@ -74,32 +88,32 @@ def pose(
 MOVEMENT_PRIMITIVES = [
     Primitive(
         "sit_up",
-        pose(0.95, -0.2, -0.9, 0.7, -0.9, 0.7, 0.45, -0.85, 0.25, 0.45, -0.85, 0.25),
+        pose(0.95, -0.2, -0.9, 0.7, -0.9, 0.7, 0.15, -0.25, -0.15, 0.25),
         0.16,
     ),
     Primitive(
         "fold_right_leg",
-        pose(1.05, -0.15, -0.7, 0.55, -0.7, 0.55, 0.35, -0.75, 0.2, 1.25, -1.45, 0.55),
+        pose(1.05, -0.15, -0.7, 0.55, -0.7, 0.55, -0.25, 0.45, -0.95, 1.65),
         0.16,
     ),
     Primitive(
         "fold_left_leg",
-        pose(1.05, -0.15, -0.65, 0.5, -0.65, 0.5, 1.25, -1.45, 0.55, 1.05, -1.15, 0.4),
+        pose(1.05, -0.15, -0.65, 0.5, -0.65, 0.5, 0.95, -1.65, 0.25, -0.45),
         0.16,
     ),
     Primitive(
         "plant_feet",
-        pose(0.85, -0.1, -0.35, 0.3, -0.35, 0.3, 0.85, -1.15, 0.65, 0.85, -1.15, 0.65),
+        pose(0.85, -0.1, -0.35, 0.3, -0.35, 0.3, 0.9, -1.65, -0.9, 1.65),
         0.16,
     ),
     Primitive(
         "extend_legs",
-        pose(0.35, 0.0, -0.15, 0.15, -0.15, 0.15, 0.25, -0.25, 0.05, 0.25, -0.25, 0.05),
+        pose(0.35, 0.0, -0.15, 0.15, -0.15, 0.15, 0.15, -0.25, -0.15, 0.25),
         0.18,
     ),
     Primitive(
         "stabilize",
-        pose(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+        pose(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
         0.18,
     ),
 ]
@@ -127,7 +141,7 @@ class Genome:
         )
 
         if phase_index == 0:
-            previous = current
+            previous = np.zeros_like(current)
         else:
             previous_index = int(self.order[phase_index - 1])
             previous = (
@@ -214,6 +228,25 @@ def make_capsule_visual(radius: float, height: float, color: list[float]) -> int
     )
 
 
+def make_x_capsule_collision(radius: float, height: float) -> int:
+    return p.createCollisionShape(
+        p.GEOM_CAPSULE,
+        radius=radius,
+        height=height,
+        collisionFrameOrientation=X_AXIS_CAPSULE_ORIENTATION,
+    )
+
+
+def make_x_capsule_visual(radius: float, height: float, color: list[float]) -> int:
+    return p.createVisualShape(
+        p.GEOM_CAPSULE,
+        radius=radius,
+        length=height,
+        rgbaColor=color,
+        visualFrameOrientation=X_AXIS_CAPSULE_ORIENTATION,
+    )
+
+
 def make_sphere_collision(radius: float) -> int:
     return p.createCollisionShape(p.GEOM_SPHERE, radius=radius)
 
@@ -223,38 +256,41 @@ def make_sphere_visual(radius: float, color: list[float]) -> int:
 
 
 def create_humanoid_robot(origin_y: float = 0.0) -> tuple[int, list[int]]:
-    """Create a compact humanoid: pelvis, torso, head, arms, legs, and feet."""
+    """Create a compact humanoid already lying supine on the ground.
+
+    The body is modeled directly in world-like coordinates: X is head/feet,
+    Z is up. The hip and knee joints rotate around Z so the legs fold sideways
+    across the floor. Feet are fixed pads, not controllable ankle joints.
+    """
 
     body_color = [0.82, 0.72, 0.43, 1]
     limb_color = [0.88, 0.78, 0.48, 1]
     foot_color = [0.55, 0.48, 0.27, 1]
 
-    pelvis_col = make_capsule_collision(0.12, 0.18)
-    torso_col = make_capsule_collision(0.16, 0.34)
+    pelvis_col = make_box_collision([0.13, 0.17, 0.075])
+    torso_col = make_x_capsule_collision(0.15, 0.36)
     head_col = make_sphere_collision(0.115)
-    upper_arm_col = make_capsule_collision(0.055, 0.22)
-    forearm_col = make_capsule_collision(0.045, 0.22)
-    thigh_col = make_capsule_collision(0.07, 0.32)
-    shin_col = make_capsule_collision(0.06, 0.34)
-    foot_col = make_box_collision([0.13, 0.055, 0.035])
+    upper_arm_col = make_x_capsule_collision(0.055, 0.22)
+    forearm_col = make_x_capsule_collision(0.045, 0.22)
+    thigh_col = make_x_capsule_collision(0.07, 0.32)
+    shin_col = make_x_capsule_collision(0.06, 0.34)
+    foot_col = make_box_collision(FOOT_HALF_EXTENTS)
 
-    pelvis_vis = make_capsule_visual(0.12, 0.18, body_color)
-    torso_vis = make_capsule_visual(0.16, 0.34, body_color)
+    pelvis_vis = make_box_visual([0.13, 0.17, 0.075], body_color)
+    torso_vis = make_x_capsule_visual(0.15, 0.36, body_color)
     head_vis = make_sphere_visual(0.115, body_color)
-    upper_arm_vis = make_capsule_visual(0.055, 0.22, limb_color)
-    forearm_vis = make_capsule_visual(0.045, 0.22, limb_color)
-    thigh_vis = make_capsule_visual(0.07, 0.32, limb_color)
-    shin_vis = make_capsule_visual(0.06, 0.34, limb_color)
-    foot_vis = make_box_visual([0.13, 0.055, 0.035], foot_color)
-
-    lying_orientation = p.getQuaternionFromEuler([0, math.radians(88), 0])
+    upper_arm_vis = make_x_capsule_visual(0.055, 0.22, limb_color)
+    forearm_vis = make_x_capsule_visual(0.045, 0.22, limb_color)
+    thigh_vis = make_x_capsule_visual(0.07, 0.32, limb_color)
+    shin_vis = make_x_capsule_visual(0.06, 0.34, limb_color)
+    foot_vis = make_box_visual(FOOT_HALF_EXTENTS, foot_color)
 
     body_id = p.createMultiBody(
         baseMass=1.4,
         baseCollisionShapeIndex=pelvis_col,
         baseVisualShapeIndex=pelvis_vis,
-        basePosition=[0, origin_y, 0.28],
-        baseOrientation=lying_orientation,
+        basePosition=[0, origin_y, START_BASE_HEIGHT],
+        baseOrientation=[0, 0, 0, 1],
         linkMasses=[1.2, 0.45, 0.35, 0.25, 0.35, 0.25, 0.75, 0.55, 0.25, 0.75, 0.55, 0.25],
         linkCollisionShapeIndices=[
             torso_col,
@@ -285,32 +321,59 @@ def create_humanoid_robot(origin_y: float = 0.0) -> tuple[int, list[int]]:
             foot_vis,
         ],
         linkPositions=[
-            [0, 0, 0.27],
-            [0, 0, 0.35],
-            [0, -0.2, 0.19],
-            [0, 0, -0.24],
-            [0, 0.2, 0.19],
-            [0, 0, -0.24],
-            [0, -0.08, -0.22],
-            [0, 0, -0.36],
-            [0.08, 0, -0.21],
-            [0, 0.08, -0.22],
-            [0, 0, -0.36],
-            [0.08, 0, -0.21],
+            [0.30, 0, 0.02],
+            [0.36, 0, 0.02],
+            [0.10, -0.24, 0.02],
+            [0.24, 0, 0],
+            [0.10, 0.24, 0.02],
+            [0.24, 0, 0],
+            [-0.24, -0.09, 0],
+            [-0.34, 0, 0],
+            [-0.27, 0, 0.095],
+            [-0.24, 0.09, 0],
+            [-0.34, 0, 0],
+            [-0.27, 0, 0.095],
         ],
-        linkOrientations=[[0, 0, 0, 1]] * CONTROL_JOINTS,
-        linkInertialFramePositions=[[0, 0, 0]] * CONTROL_JOINTS,
-        linkInertialFrameOrientations=[[0, 0, 0, 1]] * CONTROL_JOINTS,
+        linkOrientations=[[0, 0, 0, 1]] * LINK_COUNT,
+        linkInertialFramePositions=[[0, 0, 0]] * LINK_COUNT,
+        linkInertialFrameOrientations=[[0, 0, 0, 1]] * LINK_COUNT,
         linkParentIndices=[0, 1, 1, 3, 1, 5, 0, 7, 8, 0, 10, 11],
-        linkJointTypes=[p.JOINT_REVOLUTE] * CONTROL_JOINTS,
-        linkJointAxis=[[0, 1, 0]] * CONTROL_JOINTS,
+        linkJointTypes=[
+            p.JOINT_REVOLUTE,
+            p.JOINT_REVOLUTE,
+            p.JOINT_REVOLUTE,
+            p.JOINT_REVOLUTE,
+            p.JOINT_REVOLUTE,
+            p.JOINT_REVOLUTE,
+            p.JOINT_REVOLUTE,
+            p.JOINT_REVOLUTE,
+            p.JOINT_FIXED,
+            p.JOINT_REVOLUTE,
+            p.JOINT_REVOLUTE,
+            p.JOINT_FIXED,
+        ],
+        linkJointAxis=[
+            [0, 1, 0],
+            [0, 1, 0],
+            [0, 1, 0],
+            [0, 1, 0],
+            [0, 1, 0],
+            [0, 1, 0],
+            [0, 0, 1],
+            [0, 0, 1],
+            [0, 1, 0],
+            [0, 0, 1],
+            [0, 0, 1],
+            [0, 1, 0],
+        ],
     )
 
     controlled = []
     for joint_id in range(p.getNumJoints(body_id)):
         p.changeDynamics(body_id, joint_id, lateralFriction=1.4, spinningFriction=0.1)
         p.setJointMotorControl2(body_id, joint_id, p.VELOCITY_CONTROL, force=0)
-        controlled.append(joint_id)
+        if joint_id in CONTROLLED_JOINTS:
+            controlled.append(joint_id)
 
     p.changeDynamics(body_id, -1, lateralFriction=1.4, spinningFriction=0.1)
     return body_id, controlled
@@ -328,7 +391,28 @@ def reset_world(robot_count: int = 1) -> list[tuple[int, list[int], float]]:
         origin_y = (index - center) * POPULATION_SPACING
         robot_id, joints = create_humanoid_robot(origin_y)
         robots.append((robot_id, joints, origin_y))
+
+    disable_robot_collisions(robots)
+    p.performCollisionDetection()
     return robots
+
+
+def disable_robot_collisions(robots: list[tuple[int, list[int], float]]) -> None:
+    for left_index in range(len(robots)):
+        left_id = robots[left_index][0]
+        left_links = [-1] + list(range(p.getNumJoints(left_id)))
+        for right_index in range(left_index + 1, len(robots)):
+            right_id = robots[right_index][0]
+            right_links = [-1] + list(range(p.getNumJoints(right_id)))
+            for left_link in left_links:
+                for right_link in right_links:
+                    p.setCollisionFilterPair(
+                        left_id,
+                        right_id,
+                        left_link,
+                        right_link,
+                        enableCollision=0,
+                    )
 
 
 def apply_target_pose(robot_id: int, joints: list[int], target: np.ndarray) -> None:
@@ -346,14 +430,38 @@ def apply_target_pose(robot_id: int, joints: list[int], target: np.ndarray) -> N
 
 def fitness(robot_id: int, origin_y: float, average_head_height: float, energy: float) -> float:
     base_pos, base_orn = p.getBasePositionAndOrientation(robot_id)
+    linear_velocity, angular_velocity = p.getBaseVelocity(robot_id)
     roll, pitch, _yaw = p.getEulerFromQuaternion(base_orn)
+    head_height = p.getLinkState(robot_id, NECK)[0][2]
 
-    upright_bonus = max(0.0, 1.0 - abs(pitch) / math.pi) * 0.35
-    roll_penalty = abs(roll) * 0.08
+    left_foot_contacts = p.getContactPoints(bodyA=robot_id, linkIndexA=LEFT_ANKLE)
+    right_foot_contacts = p.getContactPoints(bodyA=robot_id, linkIndexA=RIGHT_ANKLE)
+    left_foot_on_world = any(contact[2] != robot_id for contact in left_foot_contacts)
+    right_foot_on_world = any(contact[2] != robot_id for contact in right_foot_contacts)
+    foot_contact_bonus = 0.08 * left_foot_on_world + 0.08 * right_foot_on_world
+    foot_contact_count = int(left_foot_on_world) + int(right_foot_on_world)
+    support_factor = 0.25 + 0.375 * foot_contact_count
+
+    upright_bonus = max(0.0, 1.0 - (abs(pitch) + abs(roll)) / math.pi) * 0.45 * support_factor
+    final_height_bonus = head_height * 0.55 * support_factor
+    average_height_bonus = average_head_height * 0.30
+    base_height_bonus = max(0.0, base_pos[2]) * 0.12
+    velocity_penalty = (
+        np.linalg.norm(linear_velocity) + 0.25 * np.linalg.norm(angular_velocity)
+    ) * 0.05
     drift_penalty = (abs(base_pos[0]) + abs(base_pos[1] - origin_y)) * 0.08
-    energy_penalty = energy * 0.00002
+    energy_penalty = energy * 0.00001
 
-    return average_head_height + upright_bonus - roll_penalty - drift_penalty - energy_penalty
+    return (
+        average_height_bonus
+        + final_height_bonus
+        + upright_bonus
+        + base_height_bonus
+        + foot_contact_bonus
+        - velocity_penalty
+        - drift_penalty
+        - energy_penalty
+    )
 
 
 def evaluate_population(
@@ -378,15 +486,20 @@ def evaluate_population(
             robot_id, joints, origin_y = robots[index]
             target = genome.target_at(step, steps)
             apply_target_pose(robot_id, joints, target)
-            energies[index] += float(np.sum(np.abs(target)))
 
         p.stepSimulation()
 
         if not p.isConnected():
             break
 
-        for index, (robot_id, _joints, _origin_y) in enumerate(robots):
+        for index, (robot_id, joints, _origin_y) in enumerate(robots):
             head_height_sums[index] += p.getLinkState(robot_id, NECK)[0][2]
+            for joint_id in joints:
+                _position, velocity, _reaction_forces, motor_torque = p.getJointState(
+                    robot_id,
+                    joint_id,
+                )
+                energies[index] += abs(motor_torque * velocity) * SIM_DT
 
         if gui and p.isConnected():
             for index, (robot_id, _joints, origin_y) in enumerate(robots):
@@ -462,20 +575,21 @@ def next_generation(
     scored: list[tuple[float, Genome]],
     population_size: int,
     elite_count: int,
+    parent_pool_size: int,
     mutation_rate: float,
     mutation_scale: float,
 ) -> list[Genome]:
     scored.sort(key=lambda item: item[0], reverse=True)
-    parent_pool = scored[:2]
-    elite_count = min(elite_count, 2)
+    parent_pool = scored[: min(parent_pool_size, len(scored))]
+    elite_count = min(elite_count, population_size, len(scored))
     next_pop = [
         Genome(weights=g.weights.copy(), order=g.order.copy())
         for _, g in scored[:elite_count]
     ]
 
     while len(next_pop) < population_size:
-        parent_a = random.choice(parent_pool)[1]
-        parent_b = random.choice(parent_pool)[1]
+        parent_a = tournament(parent_pool)
+        parent_b = tournament(parent_pool)
         child = crossover(parent_a, parent_b)
         next_pop.append(mutate(child, mutation_rate, mutation_scale))
 
@@ -514,6 +628,7 @@ def train(args: argparse.Namespace) -> Genome:
                 scored,
                 population_size=args.population,
                 elite_count=args.elites,
+                parent_pool_size=args.parent_pool,
                 mutation_rate=args.mutation_rate,
                 mutation_scale=args.mutation_scale,
             )
@@ -538,13 +653,32 @@ def replay(genome: Genome, args: argparse.Namespace) -> None:
 
 
 def parse_args() -> argparse.Namespace:
+    def positive_int(value: str) -> int:
+        parsed = int(value)
+        if parsed <= 0:
+            raise argparse.ArgumentTypeError("must be greater than 0")
+        return parsed
+
+    def non_negative_int(value: str) -> int:
+        parsed = int(value)
+        if parsed < 0:
+            raise argparse.ArgumentTypeError("must be 0 or greater")
+        return parsed
+
+    def non_negative_float(value: str) -> float:
+        parsed = float(value)
+        if parsed < 0.0:
+            raise argparse.ArgumentTypeError("must be 0 or greater")
+        return parsed
+
     parser = argparse.ArgumentParser()
-    parser.add_argument("--generations", type=int, default=30)
-    parser.add_argument("--population", type=int, default=24)
-    parser.add_argument("--elites", type=int, default=2)
-    parser.add_argument("--steps", type=int, default=DEFAULT_STEPS)
-    parser.add_argument("--mutation-rate", type=float, default=0.12)
-    parser.add_argument("--mutation-scale", type=float, default=0.22)
+    parser.add_argument("--generations", type=positive_int, default=30)
+    parser.add_argument("--population", type=positive_int, default=DEFAULT_POPULATION)
+    parser.add_argument("--elites", type=non_negative_int, default=5)
+    parser.add_argument("--parent-pool", type=positive_int, default=DEFAULT_PARENT_POOL)
+    parser.add_argument("--steps", type=positive_int, default=DEFAULT_STEPS)
+    parser.add_argument("--mutation-rate", type=non_negative_float, default=0.12)
+    parser.add_argument("--mutation-scale", type=non_negative_float, default=0.22)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--watch-population", action="store_true")
     parser.add_argument("--replay", action="store_true")
