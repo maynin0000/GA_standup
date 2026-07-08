@@ -17,9 +17,14 @@ JOINT_FORCE_LIMIT = 46.0
 POPULATION_SPACING = 1.4
 DEFAULT_POPULATION = 100
 DEFAULT_PARENT_POOL = 10
-START_BASE_HEIGHT = 0.11
+DEFAULT_KEYFRAMES = 5
+START_BASE_HEIGHT = 0.25
+SETTLING_STEPS = 60
 X_AXIS_CAPSULE_ORIENTATION = p.getQuaternionFromEuler([0, math.radians(90), 0])
 FOOT_HALF_EXTENTS = [0.055, 0.18, 0.14]
+PLANE_GROUP = 1
+ROBOT_GROUP = 2
+STABLE_TAIL_FRACTION = 0.20
 
 SPINE = 0
 NECK = 1
@@ -48,131 +53,97 @@ CONTROLLED_JOINTS = (
 )
 CONTROL_DOF = len(CONTROLLED_JOINTS)
 
+JOINT_LOWERS = np.array(
+    [-0.50, -0.50, -2.00, 0.00, -2.00, 0.00, -1.50, -2.50, -1.50, -2.50],
+    dtype=float,
+)
+JOINT_UPPERS = np.array(
+    [1.50, 0.50, 2.00, 2.50, 2.00, 2.50, 1.50, 0.00, 1.50, 0.00],
+    dtype=float,
+)
+
 
 @dataclass(frozen=True)
-class Primitive:
-    name: str
-    targets: np.ndarray
-    duration: float
-
-
-def pose(
-    spine: float,
-    neck: float,
-    left_shoulder: float,
-    left_elbow: float,
-    right_shoulder: float,
-    right_elbow: float,
-    left_hip: float,
-    left_knee: float,
-    right_hip: float,
-    right_knee: float,
-) -> np.ndarray:
-    return np.array(
-        [
-            spine,
-            neck,
-            left_shoulder,
-            left_elbow,
-            right_shoulder,
-            right_elbow,
-            left_hip,
-            left_knee,
-            right_hip,
-            right_knee,
-        ],
-        dtype=float,
-    )
-
-
-MOVEMENT_PRIMITIVES = [
-    Primitive(
-        "sit_up",
-        pose(0.95, -0.2, -0.9, 0.7, -0.9, 0.7, 0.15, -0.25, -0.15, 0.25),
-        0.16,
-    ),
-    Primitive(
-        "fold_right_leg",
-        pose(1.05, -0.15, -0.7, 0.55, -0.7, 0.55, -0.25, 0.45, -0.95, 1.65),
-        0.16,
-    ),
-    Primitive(
-        "fold_left_leg",
-        pose(1.05, -0.15, -0.65, 0.5, -0.65, 0.5, 0.95, -1.65, 0.25, -0.45),
-        0.16,
-    ),
-    Primitive(
-        "plant_feet",
-        pose(0.85, -0.1, -0.35, 0.3, -0.35, 0.3, 0.9, -1.65, -0.9, 1.65),
-        0.16,
-    ),
-    Primitive(
-        "extend_legs",
-        pose(0.35, 0.0, -0.15, 0.15, -0.15, 0.15, 0.15, -0.25, -0.15, 0.25),
-        0.18,
-    ),
-    Primitive(
-        "stabilize",
-        pose(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
-        0.18,
-    ),
-]
+class ShapeBundle:
+    pelvis_col: int
+    torso_col: int
+    head_col: int
+    upper_arm_col: int
+    forearm_col: int
+    thigh_col: int
+    shin_col: int
+    foot_col: int
+    pelvis_vis: int
+    torso_vis: int
+    head_vis: int
+    upper_arm_vis: int
+    forearm_vis: int
+    thigh_vis: int
+    shin_vis: int
+    foot_vis: int
 
 
 @dataclass
 class Genome:
-    """Primitive order plus strength values for a get-up strategy."""
+    """Free keyframe controller for an emergent get-up strategy."""
 
-    weights: np.ndarray  # shape: (len(MOVEMENT_PRIMITIVES),)
-    order: np.ndarray  # first four shuffled, final two fixed
+    keyframes: np.ndarray  # shape: (num_keyframes, CONTROL_DOF)
+    durations: np.ndarray  # shape: (num_keyframes,)
+    force_scales: np.ndarray  # shape: (num_keyframes,)
 
     @classmethod
-    def random(cls) -> "Genome":
-        order = np.array(random.sample(range(4), k=4) + [4, 5])
-        weights = np.random.uniform(0.75, 1.25, size=len(MOVEMENT_PRIMITIVES))
-        return cls(weights=weights, order=order)
+    def random(cls, num_keyframes: int = DEFAULT_KEYFRAMES) -> "Genome":
+        keyframes = np.random.uniform(
+            JOINT_LOWERS,
+            JOINT_UPPERS,
+            size=(num_keyframes, CONTROL_DOF),
+        )
+        durations = np.random.uniform(0.08, 0.35, size=num_keyframes)
+        force_scales = np.random.uniform(0.45, 1.55, size=num_keyframes)
+        return cls(keyframes=keyframes, durations=durations, force_scales=force_scales)
 
-    def target_at(self, step: int, total_steps: int) -> np.ndarray:
-        phase_index, alpha = primitive_phase(step, total_steps)
-        primitive_index = int(self.order[phase_index])
-        current = (
-            MOVEMENT_PRIMITIVES[primitive_index].targets
-            * self.weights[primitive_index]
+    @property
+    def num_keyframes(self) -> int:
+        return int(self.keyframes.shape[0])
+
+    def phase_at(self, step: int, total_steps: int) -> tuple[int, float]:
+        progress = step / max(1, total_steps - 1)
+        weights = self.durations / max(0.0001, float(np.sum(self.durations)))
+        cumulative = np.cumsum(weights)
+        phase_index = int(np.searchsorted(cumulative, progress, side="left"))
+        phase_index = min(phase_index, self.num_keyframes - 1)
+        phase_start = 0.0 if phase_index == 0 else float(cumulative[phase_index - 1])
+        phase_end = float(cumulative[phase_index])
+        alpha = (progress - phase_start) / max(0.0001, phase_end - phase_start)
+        return phase_index, float(np.clip(alpha, 0.0, 1.0))
+
+    def control_at(self, step: int, total_steps: int) -> tuple[np.ndarray, float, int]:
+        phase_index, alpha = self.phase_at(step, total_steps)
+        current = self.keyframes[phase_index]
+        previous = (
+            np.zeros(CONTROL_DOF, dtype=float)
+            if phase_index == 0
+            else self.keyframes[phase_index - 1]
         )
 
-        if phase_index == 0:
-            previous = np.zeros_like(current)
-        else:
-            previous_index = int(self.order[phase_index - 1])
-            previous = (
-                MOVEMENT_PRIMITIVES[previous_index].targets
-                * self.weights[previous_index]
-            )
-
         eased = alpha * alpha * (3.0 - 2.0 * alpha)
-        return (1.0 - eased) * previous + eased * current
-
-    def primitive_name_at(self, step: int, total_steps: int) -> str:
-        phase_index, _ = primitive_phase(step, total_steps)
-        return MOVEMENT_PRIMITIVES[int(self.order[phase_index])].name
+        target = (1.0 - eased) * previous + eased * current
+        force_scale = float(self.force_scales[phase_index])
+        return target, force_scale, phase_index
 
 
-def primitive_phase(step: int, total_steps: int) -> tuple[int, float]:
-    progress = step / max(1, total_steps - 1)
-    start = 0.0
-
-    for index, primitive in enumerate(MOVEMENT_PRIMITIVES):
-        end = start + primitive.duration
-        if progress <= end or index == len(MOVEMENT_PRIMITIVES) - 1:
-            alpha = (progress - start) / max(0.0001, primitive.duration)
-            return index, float(np.clip(alpha, 0.0, 1.0))
-        start = end
-
-    return len(MOVEMENT_PRIMITIVES) - 1, 1.0
-
-
-def order_label(genome: Genome) -> str:
-    return ">".join(MOVEMENT_PRIMITIVES[int(index)].name for index in genome.order)
+@dataclass
+class EvaluationStats:
+    average_head_height: float
+    final_head_height: float
+    final_head_over_pelvis: float
+    tail_head_over_pelvis: float
+    tail_torso_upright: float
+    tail_both_feet: float
+    tail_speed: float
+    tail_stable_fraction: float
+    drift: float
+    energy: float
 
 
 def connect(gui: bool) -> int:
@@ -255,7 +226,35 @@ def make_sphere_visual(radius: float, color: list[float]) -> int:
     return p.createVisualShape(p.GEOM_SPHERE, radius=radius, rgbaColor=color)
 
 
-def create_humanoid_robot(origin_y: float = 0.0) -> tuple[int, list[int]]:
+def build_shared_shapes() -> ShapeBundle:
+    body_color = [0.82, 0.72, 0.43, 1]
+    limb_color = [0.88, 0.78, 0.48, 1]
+    foot_color = [0.55, 0.48, 0.27, 1]
+
+    return ShapeBundle(
+        pelvis_col=make_sphere_collision(0.16),
+        torso_col=make_x_capsule_collision(0.15, 0.36),
+        head_col=make_sphere_collision(0.115),
+        upper_arm_col=make_x_capsule_collision(0.055, 0.22),
+        forearm_col=make_x_capsule_collision(0.045, 0.22),
+        thigh_col=make_x_capsule_collision(0.07, 0.32),
+        shin_col=make_x_capsule_collision(0.06, 0.34),
+        foot_col=make_box_collision(FOOT_HALF_EXTENTS),
+        pelvis_vis=make_sphere_visual(0.16, body_color),
+        torso_vis=make_x_capsule_visual(0.15, 0.36, body_color),
+        head_vis=make_sphere_visual(0.115, body_color),
+        upper_arm_vis=make_x_capsule_visual(0.055, 0.22, limb_color),
+        forearm_vis=make_x_capsule_visual(0.045, 0.22, limb_color),
+        thigh_vis=make_x_capsule_visual(0.07, 0.32, limb_color),
+        shin_vis=make_x_capsule_visual(0.06, 0.34, limb_color),
+        foot_vis=make_box_visual(FOOT_HALF_EXTENTS, foot_color),
+    )
+
+
+def create_humanoid_robot(
+    origin_y: float = 0.0,
+    shapes: ShapeBundle | None = None,
+) -> tuple[int, list[int]]:
     """Create a compact humanoid already lying supine on the ground.
 
     The body is modeled directly in world-like coordinates: X is head/feet,
@@ -263,62 +262,43 @@ def create_humanoid_robot(origin_y: float = 0.0) -> tuple[int, list[int]]:
     across the floor. Feet are fixed pads, not controllable ankle joints.
     """
 
-    body_color = [0.82, 0.72, 0.43, 1]
-    limb_color = [0.88, 0.78, 0.48, 1]
-    foot_color = [0.55, 0.48, 0.27, 1]
-
-    pelvis_col = make_box_collision([0.13, 0.17, 0.075])
-    torso_col = make_x_capsule_collision(0.15, 0.36)
-    head_col = make_sphere_collision(0.115)
-    upper_arm_col = make_x_capsule_collision(0.055, 0.22)
-    forearm_col = make_x_capsule_collision(0.045, 0.22)
-    thigh_col = make_x_capsule_collision(0.07, 0.32)
-    shin_col = make_x_capsule_collision(0.06, 0.34)
-    foot_col = make_box_collision(FOOT_HALF_EXTENTS)
-
-    pelvis_vis = make_box_visual([0.13, 0.17, 0.075], body_color)
-    torso_vis = make_x_capsule_visual(0.15, 0.36, body_color)
-    head_vis = make_sphere_visual(0.115, body_color)
-    upper_arm_vis = make_x_capsule_visual(0.055, 0.22, limb_color)
-    forearm_vis = make_x_capsule_visual(0.045, 0.22, limb_color)
-    thigh_vis = make_x_capsule_visual(0.07, 0.32, limb_color)
-    shin_vis = make_x_capsule_visual(0.06, 0.34, limb_color)
-    foot_vis = make_box_visual(FOOT_HALF_EXTENTS, foot_color)
+    if shapes is None:
+        shapes = build_shared_shapes()
 
     body_id = p.createMultiBody(
         baseMass=1.4,
-        baseCollisionShapeIndex=pelvis_col,
-        baseVisualShapeIndex=pelvis_vis,
+        baseCollisionShapeIndex=shapes.pelvis_col,
+        baseVisualShapeIndex=shapes.pelvis_vis,
         basePosition=[0, origin_y, START_BASE_HEIGHT],
         baseOrientation=[0, 0, 0, 1],
         linkMasses=[1.2, 0.45, 0.35, 0.25, 0.35, 0.25, 0.75, 0.55, 0.25, 0.75, 0.55, 0.25],
         linkCollisionShapeIndices=[
-            torso_col,
-            head_col,
-            upper_arm_col,
-            forearm_col,
-            upper_arm_col,
-            forearm_col,
-            thigh_col,
-            shin_col,
-            foot_col,
-            thigh_col,
-            shin_col,
-            foot_col,
+            shapes.torso_col,
+            shapes.head_col,
+            shapes.upper_arm_col,
+            shapes.forearm_col,
+            shapes.upper_arm_col,
+            shapes.forearm_col,
+            shapes.thigh_col,
+            shapes.shin_col,
+            shapes.foot_col,
+            shapes.thigh_col,
+            shapes.shin_col,
+            shapes.foot_col,
         ],
         linkVisualShapeIndices=[
-            torso_vis,
-            head_vis,
-            upper_arm_vis,
-            forearm_vis,
-            upper_arm_vis,
-            forearm_vis,
-            thigh_vis,
-            shin_vis,
-            foot_vis,
-            thigh_vis,
-            shin_vis,
-            foot_vis,
+            shapes.torso_vis,
+            shapes.head_vis,
+            shapes.upper_arm_vis,
+            shapes.forearm_vis,
+            shapes.upper_arm_vis,
+            shapes.forearm_vis,
+            shapes.thigh_vis,
+            shapes.shin_vis,
+            shapes.foot_vis,
+            shapes.thigh_vis,
+            shapes.shin_vis,
+            shapes.foot_vis,
         ],
         linkPositions=[
             [0.30, 0, 0.02],
@@ -369,11 +349,20 @@ def create_humanoid_robot(origin_y: float = 0.0) -> tuple[int, list[int]]:
     )
 
     controlled = []
+    p.setCollisionFilterGroupMask(body_id, -1, ROBOT_GROUP, PLANE_GROUP)
     for joint_id in range(p.getNumJoints(body_id)):
+        p.setCollisionFilterGroupMask(body_id, joint_id, ROBOT_GROUP, PLANE_GROUP)
         p.changeDynamics(body_id, joint_id, lateralFriction=1.4, spinningFriction=0.1)
         p.setJointMotorControl2(body_id, joint_id, p.VELOCITY_CONTROL, force=0)
         if joint_id in CONTROLLED_JOINTS:
             controlled.append(joint_id)
+            control_index = CONTROLLED_JOINTS.index(joint_id)
+            p.changeDynamics(
+                body_id,
+                joint_id,
+                jointLowerLimit=float(JOINT_LOWERS[control_index]),
+                jointUpperLimit=float(JOINT_UPPERS[control_index]),
+            )
 
     p.changeDynamics(body_id, -1, lateralFriction=1.4, spinningFriction=0.1)
     return body_id, controlled
@@ -383,90 +372,112 @@ def reset_world(robot_count: int = 1) -> list[tuple[int, list[int], float]]:
     p.resetSimulation()
     p.setGravity(0, 0, -9.81)
     p.setTimeStep(SIM_DT)
-    p.loadURDF("plane.urdf")
+    plane_id = p.loadURDF("plane.urdf")
+    p.setCollisionFilterGroupMask(plane_id, -1, PLANE_GROUP, ROBOT_GROUP)
 
     center = (robot_count - 1) * 0.5
+    shapes = build_shared_shapes()
     robots = []
     for index in range(robot_count):
         origin_y = (index - center) * POPULATION_SPACING
-        robot_id, joints = create_humanoid_robot(origin_y)
+        robot_id, joints = create_humanoid_robot(origin_y, shapes)
         robots.append((robot_id, joints, origin_y))
 
-    disable_robot_collisions(robots)
     p.performCollisionDetection()
     return robots
 
 
-def disable_robot_collisions(robots: list[tuple[int, list[int], float]]) -> None:
-    for left_index in range(len(robots)):
-        left_id = robots[left_index][0]
-        left_links = [-1] + list(range(p.getNumJoints(left_id)))
-        for right_index in range(left_index + 1, len(robots)):
-            right_id = robots[right_index][0]
-            right_links = [-1] + list(range(p.getNumJoints(right_id)))
-            for left_link in left_links:
-                for right_link in right_links:
-                    p.setCollisionFilterPair(
-                        left_id,
-                        right_id,
-                        left_link,
-                        right_link,
-                        enableCollision=0,
-                    )
-
-
-def apply_target_pose(robot_id: int, joints: list[int], target: np.ndarray) -> None:
+def apply_target_pose(
+    robot_id: int,
+    joints: list[int],
+    target: np.ndarray,
+    force_scale: float,
+) -> None:
     for joint_id, target_position in zip(joints, target):
         p.setJointMotorControl2(
             bodyUniqueId=robot_id,
             jointIndex=joint_id,
             controlMode=p.POSITION_CONTROL,
             targetPosition=float(target_position),
-            force=JOINT_FORCE_LIMIT,
-            positionGain=0.55,
-            velocityGain=0.12,
+            force=JOINT_FORCE_LIMIT * force_scale,
+            positionGain=0.15,
+            velocityGain=0.40,
+            maxVelocity=4.0,
         )
 
 
-def fitness(robot_id: int, origin_y: float, average_head_height: float, energy: float) -> float:
-    base_pos, base_orn = p.getBasePositionAndOrientation(robot_id)
-    linear_velocity, angular_velocity = p.getBaseVelocity(robot_id)
-    roll, pitch, _yaw = p.getEulerFromQuaternion(base_orn)
-    head_height = p.getLinkState(robot_id, NECK)[0][2]
-
+def feet_on_world(robot_id: int) -> tuple[bool, bool]:
     left_foot_contacts = p.getContactPoints(bodyA=robot_id, linkIndexA=LEFT_ANKLE)
     right_foot_contacts = p.getContactPoints(bodyA=robot_id, linkIndexA=RIGHT_ANKLE)
     left_foot_on_world = any(contact[2] != robot_id for contact in left_foot_contacts)
     right_foot_on_world = any(contact[2] != robot_id for contact in right_foot_contacts)
-    foot_contact_bonus = 0.08 * left_foot_on_world + 0.08 * right_foot_on_world
-    foot_contact_count = int(left_foot_on_world) + int(right_foot_on_world)
-    support_factor = 0.25 + 0.375 * foot_contact_count
+    return left_foot_on_world, right_foot_on_world
 
-    upright_bonus = max(0.0, 1.0 - (abs(pitch) + abs(roll)) / math.pi) * 0.45 * support_factor
-    final_height_bonus = head_height * 0.55 * support_factor
-    average_height_bonus = average_head_height * 0.30
-    base_height_bonus = max(0.0, base_pos[2]) * 0.12
-    velocity_penalty = (
-        np.linalg.norm(linear_velocity) + 0.25 * np.linalg.norm(angular_velocity)
-    ) * 0.05
-    drift_penalty = (abs(base_pos[0]) + abs(base_pos[1] - origin_y)) * 0.08
-    energy_penalty = energy * 0.00001
+
+def torso_forward_z(robot_id: int) -> float:
+    torso_orn = p.getLinkState(robot_id, SPINE)[1]
+    matrix = p.getMatrixFromQuaternion(torso_orn)
+    return float(matrix[6])
+
+
+def posture_sample(robot_id: int, origin_y: float) -> dict[str, float]:
+    base_pos, _base_orn = p.getBasePositionAndOrientation(robot_id)
+    linear_velocity, angular_velocity = p.getBaseVelocity(robot_id)
+    head_pos = p.getLinkState(robot_id, NECK)[0]
+    left_foot_on_world, right_foot_on_world = feet_on_world(robot_id)
+    speed = float(np.linalg.norm(linear_velocity) + 0.25 * np.linalg.norm(angular_velocity))
+    head_over_pelvis = float(head_pos[2] - base_pos[2])
+    torso_upright = max(0.0, torso_forward_z(robot_id))
+    both_feet = float(left_foot_on_world and right_foot_on_world)
+    stable = float(
+        both_feet
+        and speed < 0.28
+        and head_over_pelvis > 0.34
+        and torso_upright > 0.45
+    )
+
+    return {
+        "head_height": float(head_pos[2]),
+        "head_over_pelvis": head_over_pelvis,
+        "torso_upright": torso_upright,
+        "both_feet": both_feet,
+        "speed": speed,
+        "stable": stable,
+        "drift": float(abs(base_pos[0]) + abs(base_pos[1] - origin_y)),
+    }
+
+
+def fitness(stats: EvaluationStats, mode: str) -> float:
+    if mode == "simple":
+        return stats.average_head_height + 0.20 * stats.final_head_height
+
+    completion_bonus = 2.5 * stats.tail_stable_fraction
+    if (
+        stats.tail_both_feet > 0.80
+        and stats.tail_speed < 0.28
+        and stats.tail_head_over_pelvis > 0.34
+        and stats.tail_torso_upright > 0.45
+    ):
+        completion_bonus += 3.0
 
     return (
-        average_height_bonus
-        + final_height_bonus
-        + upright_bonus
-        + base_height_bonus
-        + foot_contact_bonus
-        - velocity_penalty
-        - drift_penalty
-        - energy_penalty
+        0.08 * stats.average_head_height
+        + 0.30 * stats.final_head_height
+        + 0.75 * stats.final_head_over_pelvis
+        + 0.70 * stats.tail_head_over_pelvis
+        + 0.60 * stats.tail_torso_upright
+        + 0.45 * stats.tail_both_feet
+        + completion_bonus
+        - 0.20 * stats.tail_speed
+        - 0.06 * stats.drift
+        - 0.00001 * stats.energy
     )
 
 
 def evaluate_population(
     population: list[Genome],
     steps: int,
+    fitness_mode: str,
     gui: bool = False,
     generation: int | None = None,
 ) -> list[float]:
@@ -474,18 +485,45 @@ def evaluate_population(
     if gui:
         fit_population_camera(len(population))
 
+    for _ in range(SETTLING_STEPS):
+        if not p.isConnected():
+            break
+        p.stepSimulation()
+        if gui:
+            time.sleep(SIM_DT)
+
+    for index, (robot_id, joints, _origin_y) in enumerate(robots):
+        base_pos, _base_orn = p.getBasePositionAndOrientation(robot_id)
+        robots[index] = (robot_id, joints, float(base_pos[1]))
+
     energies = np.zeros(len(population))
     head_height_sums = np.zeros(len(population))
+    tail_head_over_pelvis_sums = np.zeros(len(population))
+    tail_torso_upright_sums = np.zeros(len(population))
+    tail_both_feet_sums = np.zeros(len(population))
+    tail_speed_sums = np.zeros(len(population))
+    tail_stable_sums = np.zeros(len(population))
+    final_samples: list[dict[str, float] | None] = [None for _ in population]
     debug_text_ids = [-1 for _ in population]
+    tail_start = max(0, int(steps * (1.0 - STABLE_TAIL_FRACTION)))
+    tail_count = 0
+    simulation_alive = True
 
     for step in range(steps):
         if not p.isConnected():
             break
 
         for index, genome in enumerate(population):
-            robot_id, joints, origin_y = robots[index]
-            target = genome.target_at(step, steps)
-            apply_target_pose(robot_id, joints, target)
+            robot_id, joints, _origin_y = robots[index]
+            target, force_scale, _phase_index = genome.control_at(step, steps)
+            try:
+                apply_target_pose(robot_id, joints, target, force_scale)
+            except p.error:
+                simulation_alive = False
+                break
+
+        if not simulation_alive:
+            break
 
         p.stepSimulation()
 
@@ -493,18 +531,41 @@ def evaluate_population(
             break
 
         for index, (robot_id, joints, _origin_y) in enumerate(robots):
-            head_height_sums[index] += p.getLinkState(robot_id, NECK)[0][2]
+            try:
+                sample = posture_sample(robot_id, robots[index][2])
+            except p.error:
+                simulation_alive = False
+                break
+            final_samples[index] = sample
+            head_height_sums[index] += sample["head_height"]
+            if step >= tail_start:
+                tail_head_over_pelvis_sums[index] += sample["head_over_pelvis"]
+                tail_torso_upright_sums[index] += sample["torso_upright"]
+                tail_both_feet_sums[index] += sample["both_feet"]
+                tail_speed_sums[index] += sample["speed"]
+                tail_stable_sums[index] += sample["stable"]
             for joint_id in joints:
-                _position, velocity, _reaction_forces, motor_torque = p.getJointState(
-                    robot_id,
-                    joint_id,
-                )
+                try:
+                    _position, velocity, _reaction_forces, motor_torque = p.getJointState(
+                        robot_id,
+                        joint_id,
+                    )
+                except p.error:
+                    simulation_alive = False
+                    break
                 energies[index] += abs(motor_torque * velocity) * SIM_DT
+            if not simulation_alive:
+                break
+
+        if not simulation_alive:
+            break
+        if step >= tail_start:
+            tail_count += 1
 
         if gui and p.isConnected():
             for index, (robot_id, _joints, origin_y) in enumerate(robots):
-                primitive_name = population[index].primitive_name_at(step, steps)
-                label = f"g{generation} #{index} {primitive_name}"
+                _target, _force_scale, phase_index = population[index].control_at(step, steps)
+                label = f"g{generation} #{index} keyframe={phase_index}"
                 try:
                     debug_text_ids[index] = p.addUserDebugText(
                         label,
@@ -519,19 +580,26 @@ def evaluate_population(
 
     completed_steps = max(1, step + 1)
     average_head_heights = head_height_sums / completed_steps
+    tail_count = max(1, tail_count)
     if not p.isConnected():
         return (average_head_heights - energies * 0.00002).tolist()
 
     scores = []
     for index, (robot_id, _joints, origin_y) in enumerate(robots):
-        scores.append(
-            fitness(
-                robot_id,
-                origin_y,
-                float(average_head_heights[index]),
-                float(energies[index]),
-            )
+        sample = final_samples[index] or posture_sample(robot_id, origin_y)
+        stats = EvaluationStats(
+            average_head_height=float(average_head_heights[index]),
+            final_head_height=float(sample["head_height"]),
+            final_head_over_pelvis=float(sample["head_over_pelvis"]),
+            tail_head_over_pelvis=float(tail_head_over_pelvis_sums[index] / tail_count),
+            tail_torso_upright=float(tail_torso_upright_sums[index] / tail_count),
+            tail_both_feet=float(tail_both_feet_sums[index] / tail_count),
+            tail_speed=float(tail_speed_sums[index] / tail_count),
+            tail_stable_fraction=float(tail_stable_sums[index] / tail_count),
+            drift=float(sample["drift"]),
+            energy=float(energies[index]),
         )
+        scores.append(fitness(stats, fitness_mode))
     return scores
 
 
@@ -542,33 +610,53 @@ def tournament(population: list[tuple[float, Genome]], size: int = 3) -> Genome:
 
 
 def crossover(a: Genome, b: Genome) -> Genome:
-    mask = np.random.random(a.weights.shape) < 0.5
-    child_weights = np.where(mask, a.weights, b.weights)
-
-    if random.random() < 0.5:
-        first_four = list(a.order[:4])
-    else:
-        first_four = list(b.order[:4])
-
-    if random.random() < 0.4:
-        random.shuffle(first_four)
-
-    child_order = np.array(first_four + [4, 5])
-    return Genome(weights=child_weights.copy(), order=child_order)
+    keyframe_mask = np.random.random(a.keyframes.shape) < 0.5
+    duration_mask = np.random.random(a.durations.shape) < 0.5
+    force_mask = np.random.random(a.force_scales.shape) < 0.5
+    return Genome(
+        keyframes=np.where(keyframe_mask, a.keyframes, b.keyframes).copy(),
+        durations=np.where(duration_mask, a.durations, b.durations).copy(),
+        force_scales=np.where(force_mask, a.force_scales, b.force_scales).copy(),
+    )
 
 
 def mutate(genome: Genome, rate: float, scale: float) -> Genome:
-    weights = genome.weights.copy()
-    mask = np.random.random(weights.shape) < rate
-    weights[mask] += np.random.normal(0.0, scale, size=weights[mask].shape)
+    keyframes = genome.keyframes.copy()
+    keyframe_mask = np.random.random(keyframes.shape) < rate
+    keyframes[keyframe_mask] += np.random.normal(
+        0.0,
+        scale,
+        size=keyframes[keyframe_mask].shape,
+    )
 
-    order = genome.order.copy()
+    durations = genome.durations.copy()
+    duration_mask = np.random.random(durations.shape) < rate
+    durations[duration_mask] += np.random.normal(
+        0.0,
+        0.35 * scale,
+        size=durations[duration_mask].shape,
+    )
+
+    force_scales = genome.force_scales.copy()
+    force_mask = np.random.random(force_scales.shape) < rate
+    force_scales[force_mask] += np.random.normal(
+        0.0,
+        0.45 * scale,
+        size=force_scales[force_mask].shape,
+    )
+
+    # Rarely swap whole keyframes so evolution can discover different phase orders.
     if random.random() < rate:
-        swap_a, swap_b = random.sample(range(4), k=2)
-        order[swap_a], order[swap_b] = order[swap_b], order[swap_a]
+        swap_a, swap_b = random.sample(range(genome.num_keyframes), k=2)
+        keyframes[[swap_a, swap_b]] = keyframes[[swap_b, swap_a]]
+        durations[[swap_a, swap_b]] = durations[[swap_b, swap_a]]
+        force_scales[[swap_a, swap_b]] = force_scales[[swap_b, swap_a]]
 
-    order[4:] = [4, 5]
-    return Genome(weights=np.clip(weights, 0.35, 1.65), order=order)
+    return Genome(
+        keyframes=np.clip(keyframes, JOINT_LOWERS, JOINT_UPPERS),
+        durations=np.clip(durations, 0.05, 0.60),
+        force_scales=np.clip(force_scales, 0.20, 2.00),
+    )
 
 
 def next_generation(
@@ -583,7 +671,11 @@ def next_generation(
     parent_pool = scored[: min(parent_pool_size, len(scored))]
     elite_count = min(elite_count, population_size, len(scored))
     next_pop = [
-        Genome(weights=g.weights.copy(), order=g.order.copy())
+        Genome(
+            keyframes=g.keyframes.copy(),
+            durations=g.durations.copy(),
+            force_scales=g.force_scales.copy(),
+        )
         for _, g in scored[:elite_count]
     ]
 
@@ -597,7 +689,7 @@ def next_generation(
 
 
 def train(args: argparse.Namespace) -> Genome:
-    population = [Genome.random() for _ in range(args.population)]
+    population = [Genome.random(args.keyframes) for _ in range(args.population)]
     best: tuple[float, Genome] | None = None
 
     connect(gui=args.watch_population)
@@ -606,6 +698,7 @@ def train(args: argparse.Namespace) -> Genome:
             scores = evaluate_population(
                 population,
                 args.steps,
+                fitness_mode=args.fitness,
                 gui=args.watch_population,
                 generation=generation,
             )
@@ -618,7 +711,8 @@ def train(args: argparse.Namespace) -> Genome:
                 f"best={scored[0][0]:8.3f} "
                 f"global_best={best[0]:8.3f} "
                 f"avg={np.mean(scores):8.3f} "
-                f"order={order_label(scored[0][1])}"
+                f"fitness={args.fitness} "
+                f"keyframes={scored[0][1].num_keyframes}"
             )
 
             if args.watch_population and not p.isConnected():
@@ -642,9 +736,18 @@ def train(args: argparse.Namespace) -> Genome:
 def replay(genome: Genome, args: argparse.Namespace) -> None:
     connect(gui=True)
     try:
+        replay_count = 0
         while p.isConnected():
-            score = evaluate_population([genome], args.steps, gui=True)[0]
+            score = evaluate_population(
+                [genome],
+                args.steps,
+                fitness_mode=args.fitness,
+                gui=True,
+            )[0]
             print(f"replay score={score:.3f}")
+            replay_count += 1
+            if args.replay_count and replay_count >= args.replay_count:
+                break
             time.sleep(0.8)
     except KeyboardInterrupt:
         pass
@@ -657,6 +760,12 @@ def parse_args() -> argparse.Namespace:
         parsed = int(value)
         if parsed <= 0:
             raise argparse.ArgumentTypeError("must be greater than 0")
+        return parsed
+
+    def at_least_two(value: str) -> int:
+        parsed = int(value)
+        if parsed < 2:
+            raise argparse.ArgumentTypeError("must be 2 or greater")
         return parsed
 
     def non_negative_int(value: str) -> int:
@@ -677,11 +786,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--elites", type=non_negative_int, default=5)
     parser.add_argument("--parent-pool", type=positive_int, default=DEFAULT_PARENT_POOL)
     parser.add_argument("--steps", type=positive_int, default=DEFAULT_STEPS)
+    parser.add_argument("--keyframes", type=at_least_two, default=DEFAULT_KEYFRAMES)
+    parser.add_argument("--fitness", choices=("simple", "stable"), default="simple")
     parser.add_argument("--mutation-rate", type=non_negative_float, default=0.12)
     parser.add_argument("--mutation-scale", type=non_negative_float, default=0.22)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--watch-population", action="store_true")
     parser.add_argument("--replay", action="store_true")
+    parser.add_argument("--replay-count", type=non_negative_int, default=0)
     return parser.parse_args()
 
 
